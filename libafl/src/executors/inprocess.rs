@@ -20,6 +20,12 @@ pub use unix_signal_handler::{nop_handler, HandlerFuncPtr};
 #[cfg(all(windows, feature = "std"))]
 pub use windows_exception_handler::{nop_handler, HandlerFuncPtr};
 
+#[cfg(unix)]
+use nix::{
+    sys::wait::{waitpid, WaitStatus},
+    unistd::{fork, ForkResult},
+};
+
 use crate::{
     corpus::Corpus,
     events::{EventFirer, EventRestarter},
@@ -235,6 +241,117 @@ where
     #[inline]
     pub fn harness_mut(&mut self) -> &mut H {
         self.harness_fn
+    }
+}
+
+#[cfg(all(feature = "std", unix))]
+pub struct InProcessForkExecutor<'a, H, I, OT, S>
+where
+    H: FnMut(&I) -> ExitKind,
+    I: Input,
+    OT: ObserversTuple<I, S>,
+{
+    harness_fn: &'a mut H,
+    observers: OT,
+    phantom: PhantomData<(I, S)>,
+}
+
+impl<'a, EM, H, I, OT, S, Z> Executor<EM, I, S, Z> for InProcessForkExecutor<'a, H, I, OT, S>
+where
+    H: FnMut(&I) -> ExitKind,
+    I: Input,
+    OT: ObserversTuple<I, S>,
+{
+    #[allow(unreachable_code)]
+    #[inline]
+    fn run_target(
+        &mut self,
+        _fuzzer: &mut Z,
+        _state: &mut S,
+        _mgr: &mut EM,
+        input: &I,
+    ) -> Result<ExitKind, Error> {
+        unsafe {
+            match fork() {
+                Ok(ForkResult::Child) => {
+                    // Child
+                    (self.harness_fn)(input);
+
+                    std::process::exit(0);
+
+                    // Useless result
+                    Ok(ExitKind::Ok)
+                }
+                Ok(ForkResult::Parent { child }) => {
+                    // parent
+
+                    let res = waitpid(child, None)?;
+                    match res {
+                        WaitStatus::Signaled(_, _, _) => Ok(ExitKind::Crash),
+                        _ => Ok(ExitKind::Ok),
+                    }
+                }
+                Err(e) => Err(Error::from(e)),
+            }
+        }
+    }
+}
+
+impl<'a, H, I, OT, S> InProcessForkExecutor<'a, H, I, OT, S>
+where
+    H: FnMut(&I) -> ExitKind,
+    I: Input,
+    OT: ObserversTuple<I, S>,
+{
+    pub fn new<EM, OC, OF, Z>(
+        harness_fn: &'a mut H,
+        observers: OT,
+        _fuzzer: &mut Z,
+        _state: &mut S,
+        _event_mgr: &mut EM,
+    ) -> Result<Self, Error>
+    where
+        EM: EventFirer<I, S> + EventRestarter<S>,
+        OC: Corpus<I>,
+        OF: Feedback<I, S>,
+        S: HasSolutions<OC, I>,
+        Z: HasObjective<I, OF, S>,
+    {
+        Ok(Self {
+            harness_fn,
+            observers,
+            phantom: PhantomData,
+        })
+    }
+
+    /// Retrieve the harness function.
+    #[inline]
+    pub fn harness(&self) -> &H {
+        self.harness_fn
+    }
+
+    /// Retrieve the harness function for a mutable reference.
+    #[inline]
+    pub fn harness_mut(&mut self) -> &mut H {
+        self.harness_fn
+    }
+}
+
+
+impl<'a, H, I, OT, S> HasObservers<I, OT, S> for InProcessForkExecutor<'a, H, I, OT, S>
+where
+    H: FnMut(&I) -> ExitKind,
+    I: Input,
+    OT: ObserversTuple<I, S>,
+{
+    #[inline]
+    fn observers(&self) -> &OT {
+        &self.observers
+    }
+
+    #[inline]
+    fn observers_mut(&mut self) -> &mut OT {
+        &mut self.observers
     }
 }
 
